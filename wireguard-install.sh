@@ -10,22 +10,22 @@ NC='\033[0m'
 
 function isRoot() {
 	if [ "${EUID}" -ne 0 ]; then
-		echo "You need to run this script as root"
+		echo "Sie müssen dieses Skript als Root ausführen"
 		exit 1
 	fi
 }
 
 function checkVirt() {
 	function openvzErr() {
-		echo "OpenVZ is not supported"
+		echo "OpenVZ wird nicht unterstützt"
 		exit 1
 	}
 	function lxcErr() {
-		echo "LXC is not supported (yet)."
-		echo "WireGuard can technically run in an LXC container,"
-		echo "but the kernel module has to be installed on the host,"
-		echo "the container has to be run with some specific parameters"
-		echo "and only the tools need to be installed in the container."
+		echo "LXC wird (noch) nicht unterstützt."
+		echo "WireGuard kann technisch in einem LXC-Container laufen,"
+		echo "aber das Kernelmodul muss auf dem Host installiert werden,"
+		echo "der Container muss mit bestimmten Parametern ausgeführt werden"
+		echo "und nur die Tools müssen im Container installiert werden."
 		exit 1
 	}
 	if command -v virt-what &>/dev/null; then
@@ -291,8 +291,8 @@ PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 	if pgrep firewalld; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
 		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
-		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
-PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
+PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 	else
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
@@ -326,7 +326,7 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 	fi
 
 	newClient
-	echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+	echo -e "${GREEN}Wenn Sie weitere Clients hinzufügen möchten, führen Sie dieses Skript einfach erneut aus!${NC}"
 
 	# Check if WireGuard is running
 	if [[ ${OS} == 'alpine' ]]; then
@@ -338,21 +338,21 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 
 	# WireGuard might not work if we updated the kernel. Tell the user to reboot
 	if [[ ${WG_RUNNING} -ne 0 ]]; then
-		echo -e "\n${RED}WARNING: WireGuard does not seem to be running.${NC}"
+		echo -e "\n${RED}WARNUNG: WireGuard scheint nicht zu laufen.${NC}"
 		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${ORANGE}You can check if WireGuard is running with: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
+			echo -e "${ORANGE}Sie können überprüfen, ob WireGuard läuft mit: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
 		else
-			echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
+			echo -e "${ORANGE}Sie können überprüfen, ob WireGuard läuft mit: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
 		fi
-		echo -e "${ORANGE}If you get something like \"Cannot find device ${SERVER_WG_NIC}\", please reboot!${NC}"
+		echo -e "${ORANGE}Wenn Sie eine Meldung wie \"Gerät ${SERVER_WG_NIC} nicht gefunden\" erhalten, starten Sie den Server neu!${NC}"
 	else # WireGuard is running
-		echo -e "\n${GREEN}WireGuard is running.${NC}"
+		echo -e "\n${GREEN}WireGuard läuft.${NC}"
 		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${GREEN}You can check the status of WireGuard with: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
+			echo -e "${GREEN}Sie können den Status von WireGuard überprüfen mit: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
 		else
-			echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
+			echo -e "${GREEN}Sie können den Status von WireGuard überprüfen mit: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
 		fi
-		echo -e "${ORANGE}If you don't have internet connectivity from your client, try to reboot the server.${NC}"
+		echo -e "${ORANGE}Wenn Sie von Ihrem Client keine Internetverbindung haben, versuchen Sie, den Server neu zu starten.${NC}"
 	fi
 }
 
@@ -366,17 +366,20 @@ function newClient() {
 	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
 
 	echo ""
-	echo "Client configuration"
+	echo "Client-Konfiguration"
 	echo ""
-	echo "The client name must consist of alphanumeric character(s). It may also include underscores or dashes and can't exceed 15 chars."
+	echo "Der Client-Name muss aus alphanumerischen Zeichen bestehen. Er kann auch Unterstriche oder Bindestriche enthalten und darf 15 Zeichen nicht überschreiten."
 
+	# Initialisiere CLIENT_EXISTS
+	CLIENT_EXISTS=0
+	
 	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
-		read -rp "Client name: " -e CLIENT_NAME
+		read -rp "Client-Name: " -e CLIENT_NAME
 		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 
 		if [[ ${CLIENT_EXISTS} != 0 ]]; then
 			echo ""
-			echo -e "${ORANGE}A client with the specified name was already created, please choose another name.${NC}"
+			echo -e "${ORANGE}Ein Client mit diesem Namen existiert bereits, bitte wählen Sie einen anderen Namen.${NC}"
 			echo ""
 		fi
 	done
@@ -390,11 +393,15 @@ function newClient() {
 
 	if [[ ${DOT_EXISTS} == '1' ]]; then
 		echo ""
-		echo "The subnet configured supports only 253 clients."
+		echo "Das konfigurierte Subnetz unterstützt nur 253 Clients."
 		exit 1
 	fi
 
 	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+	
+	# Initialisiere IPV4_EXISTS
+	IPV4_EXISTS=1
+	
 	until [[ ${IPV4_EXISTS} == '0' ]]; do
 		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
 		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
@@ -427,6 +434,9 @@ function newClient() {
 		
 		return 0
 	}
+	
+	# Initialisiere IPV6_EXISTS
+	IPV6_EXISTS=1
 	
 	until [[ ${IPV6_EXISTS} == '0' ]]; do
 		read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
@@ -476,19 +486,19 @@ AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SER
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
-		echo -e "${GREEN}\nHere is your client config file as a QR Code:\n${NC}"
+		echo -e "${GREEN}\nHier ist Ihre Client-Konfigurationsdatei als QR-Code:\n${NC}"
 		qrencode -t ansiutf8 -l L <"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 		echo ""
 	fi
 
-	echo -e "${GREEN}Your client config file is in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
+	echo -e "${GREEN}Ihre Client-Konfigurationsdatei befindet sich in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
 }
 
 function listClients() {
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 		echo ""
-		echo "You have no existing clients!"
+		echo "Sie haben noch keine Clients erstellt!"
 		exit 1
 	fi
 
@@ -499,18 +509,18 @@ function revokeClient() {
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
-		echo "You have no existing clients!"
+		echo "Sie haben noch keine Clients erstellt!"
 		exit 1
 	fi
 
 	echo ""
-	echo "Select the existing client you want to revoke"
+	echo "Wählen Sie den Client, den Sie widerrufen möchten"
 	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
 	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
 		if [[ ${CLIENT_NUMBER} == '1' ]]; then
-			read -rp "Select one client [1]: " CLIENT_NUMBER
+			read -rp "Wählen Sie einen Client [1]: " CLIENT_NUMBER
 		else
-			read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
+			read -rp "Wählen Sie einen Client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
 		fi
 	done
 
@@ -530,9 +540,9 @@ function revokeClient() {
 
 function uninstallWg() {
 	echo ""
-	echo -e "\n${RED}WARNING: This will uninstall WireGuard and remove all the configuration files!${NC}"
-	echo -e "${ORANGE}Please backup the /etc/wireguard directory if you want to keep your configuration files.\n${NC}"
-	read -rp "Do you really want to remove WireGuard? [y/n]: " -e REMOVE
+	echo -e "\n${RED}WARNUNG: Dies wird WireGuard deinstallieren und alle Konfigurationsdateien entfernen!${NC}"
+	echo -e "${ORANGE}Bitte sichern Sie das Verzeichnis /etc/wireguard, wenn Sie Ihre Konfigurationsdateien behalten möchten.\n${NC}"
+	read -rp "Möchten Sie WireGuard wirklich entfernen? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == 'y' ]]; then
 		checkOS
@@ -587,15 +597,15 @@ function uninstallWg() {
 		WG_RUNNING=$?
 
 		if [[ ${WG_RUNNING} -eq 0 ]]; then
-			echo "WireGuard failed to uninstall properly."
+			echo "WireGuard konnte nicht ordnungsgemäß deinstalliert werden."
 			exit 1
 		else
-			echo "WireGuard uninstalled successfully."
+			echo "WireGuard wurde erfolgreich deinstalliert."
 			exit 0
 		fi
 	else
 		echo ""
-		echo "Removal aborted!"
+		echo "Deinstallation abgebrochen!"
 	fi
 }
 
