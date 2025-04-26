@@ -77,8 +77,9 @@ install_packages() {
     echo "Installiere notwendige Pakete..."
     if [[ "$OS" == "debian" || "$OS" == "ubuntu" ]]; then
         apt-get update
-        # openresolv wird für DNS via wg-quick benötigt, iptables für PostUp/Down
-        apt-get install -y wireguard-tools qrencode iptables openresolv
+        # Auf Ubuntu 24.04+ ist openresolv nicht verfügbar; wg-quick sollte systemd-resolved verwenden.
+        # iptables wird für PostUp/Down benötigt (oder für Firewall-Regeln, falls firewalld nicht aktiv ist)
+        apt-get install -y wireguard-tools qrencode iptables
     elif [[ "$OS" == "centos" || "$OS" == "fedora" || "$OS" == "rhel" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
         # Prüfe, ob firewalld oder iptables-services installiert sind
         PKG_MANAGER="dnf"
