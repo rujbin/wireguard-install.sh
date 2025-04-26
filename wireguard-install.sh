@@ -1,652 +1,309 @@
 #!/bin/bash
 
-RED='\033[0;31m'
-ORANGE='\033[0;33m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# WireGuard Full Automation Script
+# Installs WireGuard, configures server and first client, sets up iptables rules, generates QR code.
+# Supports IPv4 and IPv6.
 
-function isRoot() {
-	if [ "${EUID}" -ne 0 ]; then
-		echo "Sie müssen dieses Skript als Root ausführen"
-		exit 1
-	fi
+# --- Konfiguration (Anpassbar bei Bedarf) ---
+WG_INTERFACE="wg0"
+WG_PORT="51820" # Standard WireGuard Port
+WG_IPV4_SUBNET="10.0.0.0/24" # Privates Subnetz für WireGuard VPN (IPv4)
+WG_IPV6_SUBNET="fd86:ea04:4453::/64" # Privates Unique Local Address (ULA) Subnetz für WireGuard VPN (IPv6)
+SERVER_WG_IPV4="10.0.0.1" # Server IP im WG Subnetz (IPv4)
+SERVER_WG_IPV6="fd86:ea04:4453::1" # Server IP im WG Subnetz (IPv6)
+CLIENT_WG_IPV4="10.0.0.2" # Erste Client IP im WG Subnetz (IPv4)
+CLIENT_WG_IPV6="fd86:ea04:4453::2" # Erste Client IP im WG Subnetz (IPv6)
+CLIENT_NAME="client1" # Name für die erste Client-Konfigurationsdatei
+# DNS Server für Clients (optional, aber empfohlen)
+# Cloudflare (Standard), Google oder eigene verwenden
+CLIENT_DNS_1="1.1.1.1"
+CLIENT_DNS_2="1.0.0.1"
+CLIENT_DNS_IPV6="2606:4700:4700::1111" # Optionaler IPv6 DNS
+
+# --- Ende der Konfiguration ---
+
+# Exit on error
+set -e
+
+# --- Hilfsfunktionen ---
+check_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "FEHLER: Dieses Skript muss als root ausgeführt werden (z.B. mit 'sudo bash $0')."
+        exit 1
+    fi
 }
 
-function checkVirt() {
-	function openvzErr() {
-		echo "OpenVZ wird nicht unterstützt"
-		exit 1
-	}
-	function lxcErr() {
-		echo "LXC wird (noch) nicht unterstützt."
-		echo "WireGuard kann technisch in einem LXC-Container laufen,"
-		echo "aber das Kernelmodul muss auf dem Host installiert werden,"
-		echo "der Container muss mit bestimmten Parametern ausgeführt werden"
-		echo "und nur die Tools müssen im Container installiert werden."
-		exit 1
-	}
-	if command -v virt-what &>/dev/null; then
-		if [ "$(virt-what)" == "openvz" ]; then
-			openvzErr
-		fi
-		if [ "$(virt-what)" == "lxc" ]; then
-			lxcErr
-		fi
-	else
-		if [ "$(systemd-detect-virt)" == "openvz" ]; then
-			openvzErr
-		fi
-		if [ "$(systemd-detect-virt)" == "lxc" ]; then
-			lxcErr
-		fi
-	fi
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        # Freedesktop.org and systemd
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
+    elif type lsb_release >/dev/null 2>&1; then
+        # linuxbase.org
+        OS=$(lsb_release -si)
+        VER=$(lsb_release -sr)
+    elif [ -f /etc/lsb-release ]; then
+        # For some versions of Debian/Ubuntu without lsb_release command
+        . /etc/lsb-release
+        OS=$DISTRIB_ID
+        VER=$DISTRIB_RELEASE
+    elif [ -f /etc/debian_version ]; then
+        # Older Debian/Ubuntu/etc.
+        OS=Debian
+        VER=$(cat /etc/debian_version)
+    elif [ -f /etc/redhat-release ]; then
+        # Older Red Hat, CentOS, etc.
+         OS=$(cat /etc/redhat-release | cut -d' ' -f1)
+         VER=$(cat /etc/redhat-release | sed s/.*release\ // | sed s/\ .*//)
+    else
+        # Fall back to uname, e.g. "Linux <version>", also works for BSD, etc.
+        OS=$(uname -s)
+        VER=$(uname -r)
+    fi
+    OS=$(echo "$OS" | tr '[:upper:]' '[:lower:]') # Lowercase OS name
+    echo "Betriebssystem erkannt: $OS $VER"
 }
 
-function checkOS() {
-	source /etc/os-release
-	OS="${ID}"
-	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
-		if [[ ${VERSION_ID} -lt 11 ]]; then
-			echo "Ihre Debian-Version (${VERSION_ID}) wird nicht unterstützt. Bitte verwenden Sie Debian 11 Bullseye oder neuer"
-			exit 1
-		fi
-		OS=debian # overwrite if raspbian
-	elif [[ ${OS} == "ubuntu" ]]; then
-		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
-		if [[ ${RELEASE_YEAR} -lt 20 ]]; then
-			echo "Ihre Ubuntu-Version (${VERSION_ID}) wird nicht unterstützt. Bitte verwenden Sie Ubuntu 20.04 oder neuer"
-			exit 1
-		fi
-	elif [[ ${OS} == "fedora" ]]; then
-		if [[ ${VERSION_ID} -lt 37 ]]; then
-			echo "Ihre Fedora-Version (${VERSION_ID}) wird nicht unterstützt. Bitte verwenden Sie Fedora 37 oder neuer"
-			exit 1
-		fi
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-		if [[ ${VERSION_ID} == 7* ]] || [[ ${VERSION_ID} -lt 8 ]]; then
-			echo "Ihre Version von CentOS/AlmaLinux/Rocky (${VERSION_ID}) wird nicht unterstützt. Bitte verwenden Sie Version 8 oder neuer"
-			exit 1
-		fi
-	elif [[ -e /etc/oracle-release ]]; then
-		source /etc/os-release
-		OS=oracle
-	elif [[ -e /etc/arch-release ]]; then
-		OS=arch
-	elif [[ -e /etc/alpine-release ]]; then
-		OS=alpine
-		if ! command -v virt-what &>/dev/null; then
-			apk update && apk add virt-what
-		fi
-	else
-		echo "Es scheint, dass Sie diesen Installer nicht auf einem unterstützten System ausführen (Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Oracle oder Arch Linux)"
-		exit 1
-	fi
+install_packages() {
+    echo "Installiere notwendige Pakete..."
+    if [[ "$OS" == "debian" || "$OS" == "ubuntu" ]]; then
+        apt-get update
+        apt-get install -y wireguard qrencode iptables openresolv # openresolv für DNS in wg-quick
+    elif [[ "$OS" == "centos" || "$OS" == "fedora" || "$OS" == "rhel" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
+         if [[ "$OS" == "centos" && ${VER%%.*} -lt 8 ]]; then
+             echo "CentOS 7 wird erkannt. EPEL Repository wird benötigt."
+             yum install -y epel-release
+             yum install -y wireguard-tools qrencode iptables-services # wireguard-dkms könnte auch nötig sein, falls Kernel < 5.6
+         else
+             dnf install -y wireguard-tools qrencode iptables-services # Kernel sollte WireGuard Modul haben
+         fi
+         # Stelle sicher, dass iptables verwendet wird, falls firewalld aktiv ist (oder konfiguriere firewalld)
+         # systemctl disable --now firewalld # Vorsicht! Deaktiviert firewalld komplett.
+         # systemctl enable --now iptables ip6tables # Alternative, falls firewalld deaktiviert wird
+         # echo "WARNUNG: firewalld könnte aktiv sein. Regeln werden für iptables erstellt."
+         # echo "         Manuelle Konfiguration von firewalld könnte nötig sein: 'firewall-cmd --add-port=${WG_PORT}/udp --permanent && firewall-cmd --reload'"
+    else
+        echo "FEHLER: Nicht unterstützte Distribution '$OS'. Bitte manuell installieren: wireguard-tools, qrencode, iptables."
+        exit 1
+    fi
+    echo "Pakete installiert."
 }
 
-function getHomeDirForClient() {
-	local CLIENT_NAME=$1
+detect_network() {
+    echo "Ermittle Netzwerk-Konfiguration..."
+    SERVER_PUB_NIC=$(ip route | grep default | awk '{print $5}' | head -n 1)
+    if [[ -z "$SERVER_PUB_NIC" ]]; then
+        echo "FEHLER: Konnte das Standard-Netzwerkinterface nicht automatisch finden."
+        exit 1
+    fi
+    echo "Öffentliches Interface erkannt: $SERVER_PUB_NIC"
 
-	if [ -z "${CLIENT_NAME}" ]; then
-		echo "Error: getHomeDirForClient() requires a client name as argument"
-		exit 1
-	fi
+    # Versuche öffentliche IPv4 zu ermitteln (mehrere Methoden)
+    SERVER_IPV4=$(ip -4 addr show dev "$SERVER_PUB_NIC" | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
+    if [[ -z "$SERVER_IPV4" ]]; then
+        echo "Konnte lokale IPv4 auf $SERVER_PUB_NIC nicht finden, versuche externen Dienst..."
+        SERVER_IPV4=$(curl -4s https://ifconfig.me/ip || curl -4s https://api.ipify.org || wget -qO- -t1 -T2 ipv4.icanhazip.com)
+    fi
+    if [[ -z "$SERVER_IPV4" ]]; then
+        echo "FEHLER: Konnte die öffentliche IPv4 Adresse nicht ermitteln."
+        exit 1
+    fi
+     echo "Öffentliche IPv4 erkannt: $SERVER_IPV4"
 
-	# Home directory of the user, where the client configuration will be written
-	if [ -e "/home/${CLIENT_NAME}" ]; then
-		# if $1 is a user name
-		HOME_DIR="/home/${CLIENT_NAME}"
-	elif [ "${SUDO_USER}" ]; then
-		# if not, use SUDO_USER
-		if [ "${SUDO_USER}" == "root" ]; then
-			# If running sudo as root
-			HOME_DIR="/root"
-		else
-			HOME_DIR="/home/${SUDO_USER}"
-		fi
-	else
-		# if not SUDO_USER, use /root
-		HOME_DIR="/root"
-	fi
+    # Versuche öffentliche IPv6 zu ermitteln (optional)
+    SERVER_IPV6=$(ip -6 addr show dev "$SERVER_PUB_NIC" scope global | grep 'inet6' | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
+     if [[ -z "$SERVER_IPV6" ]]; then
+        echo "Konnte keine globale IPv6 auf $SERVER_PUB_NIC finden, versuche externen Dienst..."
+        SERVER_IPV6=$(curl -6s https://ifconfig.me/ip || curl -6s https://api6.ipify.org || wget -qO- -t1 -T2 ipv6.icanhazip.com)
+     fi
 
-	echo "$HOME_DIR"
+    if [[ -z "$SERVER_IPV6" ]]; then
+        echo "WARNUNG: Konnte keine öffentliche IPv6 Adresse ermitteln. IPv6 wird für den Client-Endpoint übersprungen."
+        USE_IPV6=false
+    else
+        echo "Öffentliche IPv6 erkannt: $SERVER_IPV6"
+        USE_IPV6=true
+    fi
 }
 
-function initialCheck() {
-	isRoot
-	checkOS
-	checkVirt
+generate_keys() {
+    echo "Generiere Schlüsselpaare..."
+    umask 077 # Stelle sicher, dass Schlüssel nur für root lesbar sind
+    mkdir -p /etc/wireguard/
+
+    SERVER_PRIVKEY=$(wg genkey)
+    SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
+    echo "$SERVER_PRIVKEY" > "/etc/wireguard/${WG_INTERFACE}_server_private.key"
+    echo "$SERVER_PUBKEY" > "/etc/wireguard/${WG_INTERFACE}_server_public.key"
+    chmod 600 "/etc/wireguard/${WG_INTERFACE}_server_private.key"
+
+    CLIENT_PRIVKEY=$(wg genkey)
+    CLIENT_PUBKEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
+    echo "$CLIENT_PRIVKEY" > "/etc/wireguard/${CLIENT_NAME}_private.key"
+    echo "$CLIENT_PUBKEY" > "/etc/wireguard/${CLIENT_NAME}_public.key"
+    chmod 600 "/etc/wireguard/${CLIENT_NAME}_private.key"
+
+    echo "Schlüssel generiert und in /etc/wireguard/ gespeichert."
 }
 
-function installQuestions() {
-	echo "Willkommen beim WireGuard-Installer!"
-	echo "Das Git-Repository ist verfügbar unter: https://github.com/angristan/wireguard-install"
-	echo ""
-	echo "Ich muss Ihnen einige Fragen stellen, bevor ich mit der Einrichtung beginne."
-	echo "Sie können die Standardoptionen beibehalten und einfach Enter drücken, wenn Sie damit einverstanden sind."
-	echo ""
+configure_server() {
+    echo "Konfiguriere WireGuard Server (/etc/wireguard/${WG_INTERFACE}.conf)..."
 
-	# Detect public IPv4 or IPv6 address and pre-fill for the user
-	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-	if [[ -z ${SERVER_PUB_IP} ]]; then
-		# Detect public IPv6 address
-		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
-	fi
-	read -rp "Öffentliche IPv4- oder IPv6-Adresse: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+    # Firewall-Regeln für PostUp/PostDown
+    IPTABLES_POSTUP="iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE"
+    IPTABLES_POSTDOWN="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE"
 
-	# Detect public interface and pre-fill for the user
-	SERVER_NIC="$(ip -4 route ls | grep default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}' | head -1)"
-	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
-		read -rp "Öffentliche Netzwerkschnittstelle: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
-	done
+    IP6TABLES_POSTUP=""
+    IP6TABLES_POSTDOWN=""
+    if [ "$USE_IPV6" = true ]; then
+        IP6TABLES_POSTUP="ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE"
+        IP6TABLES_POSTDOWN="ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE"
+    fi
 
-	until [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; do
-		read -rp "WireGuard-Schnittstellenname: " -e -i wg0 SERVER_WG_NIC
-	done
+    # Server Konfigurationsdatei erstellen
+    cat > "/etc/wireguard/${WG_INTERFACE}.conf" << EOF
+[Interface]
+Address = ${SERVER_WG_IPV4}/$(echo $WG_IPV4_SUBNET | cut -d'/' -f2)
+$( [ "$USE_IPV6" = true ] && echo "Address = ${SERVER_WG_IPV6}/$(echo $WG_IPV6_SUBNET | cut -d'/' -f2)" )
+ListenPort = ${WG_PORT}
+PrivateKey = ${SERVER_PRIVKEY}
+# Firewall Regeln / NAT aktivieren, wenn Interface startet
+PostUp = ${IPTABLES_POSTUP}; ${IP6TABLES_POSTUP}
+# Firewall Regeln entfernen, wenn Interface stoppt
+PostDown = ${IPTABLES_POSTDOWN}; ${IP6TABLES_POSTDOWN}
+SaveConfig = false # Änderungen an der Konfiguration NICHT automatisch speichern
 
-	until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
-		read -rp "Server WireGuard IPv4-Adresse: " -e -i 10.66.66.1 SERVER_WG_IPV4
-	done
-
-	# Verbesserte IPv6-Validierung
-	# Diese Validierung erlaubt verschiedene gültige IPv6-Formate
-	validate_ipv6() {
-		local ipv6="$1"
-		# Überprüft ob die IPv6-Adresse dem ULA-Bereich (fd00::/8) entspricht
-		if [[ ! $ipv6 =~ ^fd ]]; then
-			return 1
-		fi
-		
-		# Überprüft grundlegende Struktur einer IPv6-Adresse
-		if [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,7}([0-9a-fA-F]{0,4})?$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,7}:$ ]] && 
-		   [[ ! $ipv6 =~ ^:(:([0-9a-fA-F]{1,4})){1,7}$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,6}(:[0-9a-fA-F]{1,4}){1,1}$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}$ ]] && 
-		   [[ ! $ipv6 =~ ^([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}$ ]] && 
-		   [[ ! $ipv6 =~ ^[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})$ ]] && 
-		   [[ ! $ipv6 =~ ^:((:[0-9a-fA-F]{1,4}){1,7}|:)$ ]] && 
-		   [[ ! $ipv6 =~ ^fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}$ ]]; then
-			return 1
-		fi
-		
-		return 0
-	}
-
-	until validate_ipv6 "$SERVER_WG_IPV6"; do
-		read -rp "Server WireGuard IPv6 (ULA fd00::/8): " -e -i fd42:42:42::1 SERVER_WG_IPV6
-		if ! validate_ipv6 "$SERVER_WG_IPV6"; then
-			echo -e "\nUngültige IPv6-Adresse. Bitte verwenden Sie eine gültige ULA-Adresse (beginnt mit 'fd')."
-		fi
-	done
-
-	# Generate random number within private ports range
-	RANDOM_PORT=$(shuf -i49152-65535 -n1)
-	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
-		read -rp "Server WireGuard-Port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
-	done
-
-	# Adguard DNS by default
-	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-		read -rp "Erster DNS-Server für die Clients: " -e -i 1.1.1.1 CLIENT_DNS_1
-	done
-	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-		read -rp "Zweiter DNS-Server für die Clients (optional): " -e -i 1.0.0.1 CLIENT_DNS_2
-		if [[ ${CLIENT_DNS_2} == "" ]]; then
-			CLIENT_DNS_2="${CLIENT_DNS_1}"
-		fi
-	done
-
-	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
-		echo -e "\nWireGuard verwendet einen Parameter namens AllowedIPs, um zu bestimmen, was über das VPN geroutet wird."
-		read -rp "Liste der erlaubten IPs für generierte Clients (Standard leert, um alles zu routen): " -e -i '0.0.0.0/0,::/0' ALLOWED_IPS
-		if [[ ${ALLOWED_IPS} == "" ]]; then
-			ALLOWED_IPS="0.0.0.0/0,::/0"
-		fi
-	done
-
-	echo ""
-	echo "Alles klar, das war alles, was ich brauchte. Wir sind bereit, Ihren WireGuard-Server jetzt einzurichten."
-	echo "Sie können am Ende der Installation einen Client generieren."
-	read -n1 -r -p "Drücken Sie eine beliebige Taste, um fortzufahren..."
+# --- Erster Client ---
+[Peer]
+# Name = ${CLIENT_NAME}
+PublicKey = ${CLIENT_PUBKEY}
+AllowedIPs = ${CLIENT_WG_IPV4}/32$( [ "$USE_IPV6" = true ] && echo ", ${CLIENT_WG_IPV6}/128" )
+EOF
+    chmod 600 "/etc/wireguard/${WG_INTERFACE}.conf"
+    echo "Server Konfiguration erstellt."
 }
 
-function installWireGuard() {
-	# Run setup questions first
-	installQuestions
+configure_client() {
+    echo "Erstelle Client Konfigurationsdatei (~/${CLIENT_NAME}.conf)..."
 
-	# Install WireGuard tools and module
-	if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
-		apt-get update
-		apt-get install -y wireguard iptables resolvconf qrencode
-	elif [[ ${OS} == 'debian' ]]; then
-		if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
-			echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
-			apt-get update
-		fi
-		apt update
-		apt-get install -y iptables resolvconf qrencode
-		apt-get install -y -t buster-backports wireguard
-	elif [[ ${OS} == 'fedora' ]]; then
-		if [[ ${VERSION_ID} -lt 32 ]]; then
-			dnf install -y dnf-plugins-core
-			dnf copr enable -y jdoss/wireguard
-			dnf install -y wireguard-dkms
-		fi
-		dnf install -y wireguard-tools iptables qrencode
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-		if [[ ${VERSION_ID} == 8* ]]; then
-			yum install -y epel-release elrepo-release
-			yum install -y kmod-wireguard
-			yum install -y qrencode # not available on release 9
-		fi
-		yum install -y wireguard-tools iptables
-	elif [[ ${OS} == 'oracle' ]]; then
-		dnf install -y oraclelinux-developer-release-el8
-		dnf config-manager --disable -y ol8_developer
-		dnf config-manager --enable -y ol8_developer_UEKR6
-		dnf config-manager --save -y --setopt=ol8_developer_UEKR6.includepkgs='wireguard-tools*'
-		dnf install -y wireguard-tools qrencode iptables
-	elif [[ ${OS} == 'arch' ]]; then
-		pacman -S --needed --noconfirm wireguard-tools qrencode
-	elif [[ ${OS} == 'alpine' ]]; then
-		apk update
-		apk add wireguard-tools iptables build-base libpng-dev
-		curl -O https://fukuchi.org/works/qrencode/qrencode-4.1.1.tar.gz
-		tar xf qrencode-4.1.1.tar.gz
-		(cd qrencode-4.1.1 || exit && ./configure && make && make install && ldconfig)
-	fi
+    # Wähle den Endpoint basierend auf verfügbarer IP Version
+    ENDPOINT=""
+    if [[ "$USE_IPV6" = true && -n "$SERVER_IPV6" ]]; then
+        # Bevorzuge IPv6, wenn verfügbar und nicht link-local
+        if [[ ! $SERVER_IPV6 =~ ^fe80:: ]]; then
+             ENDPOINT="[${SERVER_IPV6}]:${WG_PORT}"
+        fi
+    fi
+    # Fallback auf IPv4 oder wenn nur IPv4 verfügbar
+    if [[ -z "$ENDPOINT" && -n "$SERVER_IPV4" ]]; then
+        ENDPOINT="${SERVER_IPV4}:${WG_PORT}"
+    fi
 
-	# Make sure the directory exists (this does not seem the be the case on fedora)
-	mkdir /etc/wireguard >/dev/null 2>&1
+    if [[ -z "$ENDPOINT" ]]; then
+         echo "FEHLER: Konnte keinen gültigen Server Endpoint (IPv4 oder IPv6) bestimmen."
+         exit 1
+    fi
+    echo "Client wird Endpoint verwenden: $ENDPOINT"
 
-	chmod 600 -R /etc/wireguard/
-
-	SERVER_PRIV_KEY=$(wg genkey)
-	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
-
-	# Save WireGuard settings
-	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
-SERVER_PUB_NIC=${SERVER_PUB_NIC}
-SERVER_WG_NIC=${SERVER_WG_NIC}
-SERVER_WG_IPV4=${SERVER_WG_IPV4}
-SERVER_WG_IPV6=${SERVER_WG_IPV6}
-SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
-SERVER_PUB_KEY=${SERVER_PUB_KEY}
-CLIENT_DNS_1=${CLIENT_DNS_1}
-CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
-
-	# Add server interface
-	echo "[Interface]
-Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
-ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
-
-	if pgrep firewalld; then
-		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
-		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
-		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
-PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-	fi
-
-	# Enable routing on the server
-	echo "net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
-
-	if [[ ${OS} == 'alpine' ]]; then
-		sysctl -p /etc/sysctl.d/wg.conf
-		rc-update add sysctl
-		ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-		rc-service "wg-quick.${SERVER_WG_NIC}" start
-		rc-update add "wg-quick.${SERVER_WG_NIC}"
-	else
-		sysctl --system
-
-		systemctl start "wg-quick@${SERVER_WG_NIC}"
-		systemctl enable "wg-quick@${SERVER_WG_NIC}"
-	fi
-
-	newClient
-	echo -e "${GREEN}Wenn Sie weitere Clients hinzufügen möchten, führen Sie dieses Skript einfach erneut aus!${NC}"
-
-	# Check if WireGuard is running
-	if [[ ${OS} == 'alpine' ]]; then
-		rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
-	else
-		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
-	fi
-	WG_RUNNING=$?
-
-	# WireGuard might not work if we updated the kernel. Tell the user to reboot
-	if [[ ${WG_RUNNING} -ne 0 ]]; then
-		echo -e "\n${RED}WARNUNG: WireGuard scheint nicht zu laufen.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${ORANGE}Sie können überprüfen, ob WireGuard läuft mit: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
-		else
-			echo -e "${ORANGE}Sie können überprüfen, ob WireGuard läuft mit: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
-		fi
-		echo -e "${ORANGE}Wenn Sie eine Meldung wie \"Gerät ${SERVER_WG_NIC} nicht gefunden\" erhalten, starten Sie den Server neu!${NC}"
-	else # WireGuard is running
-		echo -e "\n${GREEN}WireGuard läuft.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${GREEN}Sie können den Status von WireGuard überprüfen mit: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
-		else
-			echo -e "${GREEN}Sie können den Status von WireGuard überprüfen mit: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
-		fi
-		echo -e "${ORANGE}Wenn Sie von Ihrem Client keine Internetverbindung haben, versuchen Sie, den Server neu zu starten.${NC}"
-	fi
-}
-
-function newClient() {
-	# If SERVER_PUB_IP is IPv6, add brackets if missing
-	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
-		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
-			SERVER_PUB_IP="[${SERVER_PUB_IP}]"
-		fi
-	fi
-	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
-
-	echo ""
-	echo "Client-Konfiguration"
-	echo ""
-	echo "Der Client-Name muss aus alphanumerischen Zeichen bestehen. Er kann auch Unterstriche oder Bindestriche enthalten und darf 15 Zeichen nicht überschreiten."
-
-	# Initialisiere CLIENT_EXISTS
-	CLIENT_EXISTS=0
-	
-	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
-		read -rp "Client-Name: " -e CLIENT_NAME
-		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-
-		if [[ ${CLIENT_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}Ein Client mit diesem Namen existiert bereits, bitte wählen Sie einen anderen Namen.${NC}"
-			echo ""
-		fi
-	done
-
-	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-		if [[ ${DOT_EXISTS} == '0' ]]; then
-			break
-		fi
-	done
-
-	if [[ ${DOT_EXISTS} == '1' ]]; then
-		echo ""
-		echo "Das konfigurierte Subnetz unterstützt nur 253 Clients."
-		exit 1
-	fi
-
-	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
-	
-	# Initialisiere IPV4_EXISTS
-	IPV4_EXISTS=1
-	
-	until [[ ${IPV4_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
-		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-
-		if [[ ${IPV4_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}Ein Client mit dieser IPv4-Adresse existiert bereits, bitte wählen Sie eine andere IPv4-Adresse.${NC}"
-			echo ""
-		fi
-	done
-
-	BASE_IP=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
-	
-	# Verbesserte Client IPv6-Validierung
-	validate_client_ipv6() {
-		local base_prefix="$1"
-		local suffix="$2"
-		local full_ipv6="${base_prefix}::${suffix}"
-		
-		# Überprüft, ob der Suffix eine gültige Hexadezimalzahl ist
-		if [[ ! $suffix =~ ^[0-9a-fA-F]+$ ]]; then
-			return 1
-		fi
-		
-		# Überprüft, ob die resultierende IPv6-Adresse gültig ist
-		if [[ ${#suffix} -gt 4 ]]; then
-			return 1
-		fi
-		
-		return 0
-	}
-	
-	# Initialisiere IPV6_EXISTS
-	IPV6_EXISTS=1
-	
-	until [[ ${IPV6_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
-		
-		if ! validate_client_ipv6 "$BASE_IP" "$DOT_IP"; then
-			echo -e "\n${ORANGE}Ungültige IPv6-Adresse. Bitte verwenden Sie einen gültigen hexadezimalen Suffix.${NC}"
-			continue
-		fi
-		
-		CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
-		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-
-		if [[ ${IPV6_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}Ein Client mit dieser IPv6-Adresse existiert bereits, bitte wählen Sie eine andere IPv6-Adresse.${NC}"
-			echo ""
-		fi
-	done
-
-	# Generate key pair for the client
-	CLIENT_PRIV_KEY=$(wg genkey)
-	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
-	CLIENT_PRE_SHARED_KEY=$(wg genpsk)
-
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
-
-	# Create client file and add the server as a peer
-	echo "[Interface]
-PrivateKey = ${CLIENT_PRIV_KEY}
-Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128
-DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
+    # Client Konfigurationsdatei erstellen
+    cat > ~/"${CLIENT_NAME}.conf" << EOF
+[Interface]
+# Name = ${CLIENT_NAME}
+PrivateKey = ${CLIENT_PRIVKEY}
+Address = ${CLIENT_WG_IPV4}/$(echo $WG_IPV4_SUBNET | cut -d'/' -f2)
+$( [ "$USE_IPV6" = true ] && echo "Address = ${CLIENT_WG_IPV6}/$(echo $WG_IPV6_SUBNET | cut -d'/' -f2)" )
+DNS = ${CLIENT_DNS_1}$( [ -n "$CLIENT_DNS_2" ] && echo ", ${CLIENT_DNS_2}" )$( [ -n "$CLIENT_DNS_IPV6" ] && echo ", ${CLIENT_DNS_IPV6}" )
 
 [Peer]
-PublicKey = ${SERVER_PUB_KEY}
-PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+# Name = Server
+PublicKey = ${SERVER_PUBKEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
-
-	# Add the client as a peer to the server
-	echo -e "\n### Client ${CLIENT_NAME}
-[Peer]
-PublicKey = ${CLIENT_PUB_KEY}
-PresharedKey = ${CLIENT_PRE_SHARED_KEY}
-AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
-
-	# Generate QR code if qrencode is installed
-	if command -v qrencode &>/dev/null; then
-		echo -e "${GREEN}\nHier ist Ihre Client-Konfigurationsdatei als QR-Code:\n${NC}"
-		qrencode -t ansiutf8 -l L <"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
-		echo ""
-	fi
-
-	echo -e "${GREEN}Ihre Client-Konfigurationsdatei befindet sich in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
+AllowedIPs = 0.0.0.0/0$( [ "$USE_IPV6" = true ] && echo ", ::/0" )
+# Optional: PersistentKeepalive alle 25 Sekunden senden, um NAT/Firewall offen zu halten
+# PersistentKeepalive = 25
+EOF
+    chmod 600 ~/"${CLIENT_NAME}.conf"
+    echo "Client Konfiguration gespeichert in ~/${CLIENT_NAME}.conf"
 }
 
-function listClients() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
-		echo ""
-		echo "Sie haben noch keine Clients erstellt!"
-		exit 1
-	fi
+enable_forwarding() {
+    echo "Aktiviere IP Forwarding..."
+    # Aktiviere sofort
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    if [ "$USE_IPV6" = true ]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null
+    fi
 
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+    # Mache es permanent
+    CONF_FILE="/etc/sysctl.d/99-wireguard-forward.conf"
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "net.ipv4.ip_forward=1" > "$CONF_FILE"
+        if [ "$USE_IPV6" = true ]; then
+            echo "net.ipv6.conf.all.forwarding=1" >> "$CONF_FILE"
+        fi
+        sysctl -p "$CONF_FILE" > /dev/null
+        echo "IP Forwarding permanent aktiviert in $CONF_FILE."
+    else
+        # Sicherstellen, dass die Werte gesetzt sind
+        grep -qxF "net.ipv4.ip_forward=1" "$CONF_FILE" || echo "net.ipv4.ip_forward=1" >> "$CONF_FILE"
+        if [ "$USE_IPV6" = true ]; then
+             grep -qxF "net.ipv6.conf.all.forwarding=1" "$CONF_FILE" || echo "net.ipv6.conf.all.forwarding=1" >> "$CONF_FILE"
+        fi
+         sysctl -p "$CONF_FILE" > /dev/null
+        echo "IP Forwarding war bereits konfiguriert, Werte überprüft in $CONF_FILE."
+    fi
 }
 
-function revokeClient() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
-		echo ""
-		echo "Sie haben noch keine Clients erstellt!"
-		exit 1
-	fi
+start_wireguard() {
+    echo "Starte und aktiviere WireGuard Service (wg-quick@${WG_INTERFACE})..."
+    systemctl enable wg-quick@${WG_INTERFACE}
+    systemctl restart wg-quick@${WG_INTERFACE} # Neustart statt nur Start, falls es schon lief
 
-	echo ""
-	echo "Wählen Sie den Client, den Sie widerrufen möchten"
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
-	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
-		if [[ ${CLIENT_NUMBER} == '1' ]]; then
-			read -rp "Wählen Sie einen Client [1]: " CLIENT_NUMBER
-		else
-			read -rp "Wählen Sie einen Client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
-		fi
-	done
-
-	# match the selected number to a client name
-	CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
-
-	# remove [Peer] block matching $CLIENT_NAME
-	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
-
-	# remove generated client file
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
-	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
-
-	# restart wireguard to apply changes
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+    # Kurze Pause und Statusprüfung
+    sleep 2
+    if systemctl is-active --quiet wg-quick@${WG_INTERFACE}; then
+        echo "WireGuard Service läuft."
+        wg show ${WG_INTERFACE}
+    else
+        echo "FEHLER: WireGuard Service konnte nicht gestartet werden!"
+        echo "Überprüfe Logs mit: journalctl -u wg-quick@${WG_INTERFACE}"
+        exit 1
+    fi
 }
 
-function uninstallWg() {
-	echo ""
-	echo -e "\n${RED}WARNUNG: Dies wird WireGuard deinstallieren und alle Konfigurationsdateien entfernen!${NC}"
-	echo -e "${ORANGE}Bitte sichern Sie das Verzeichnis /etc/wireguard, wenn Sie Ihre Konfigurationsdateien behalten möchten.\n${NC}"
-	read -rp "Möchten Sie WireGuard wirklich entfernen? [y/n]: " -e REMOVE
-	REMOVE=${REMOVE:-n}
-	if [[ $REMOVE == 'y' ]]; then
-		checkOS
-
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service "wg-quick.${SERVER_WG_NIC}" stop
-			rc-update del "wg-quick.${SERVER_WG_NIC}"
-			unlink "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-			rc-update del sysctl
-		else
-			systemctl stop "wg-quick@${SERVER_WG_NIC}"
-			systemctl disable "wg-quick@${SERVER_WG_NIC}"
-		fi
-
-		if [[ ${OS} == 'ubuntu' ]]; then
-			apt-get remove -y wireguard wireguard-tools qrencode
-		elif [[ ${OS} == 'debian' ]]; then
-			apt-get remove -y wireguard wireguard-tools qrencode
-		elif [[ ${OS} == 'fedora' ]]; then
-			dnf remove -y --noautoremove wireguard-tools qrencode
-			if [[ ${VERSION_ID} -lt 32 ]]; then
-				dnf remove -y --noautoremove wireguard-dkms
-				dnf copr disable -y jdoss/wireguard
-			fi
-		elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-			yum remove -y --noautoremove wireguard-tools
-			if [[ ${VERSION_ID} == 8* ]]; then
-				yum remove --noautoremove kmod-wireguard qrencode
-			fi
-		elif [[ ${OS} == 'oracle' ]]; then
-			yum remove --noautoremove wireguard-tools qrencode
-		elif [[ ${OS} == 'arch' ]]; then
-			pacman -Rs --noconfirm wireguard-tools qrencode
-		elif [[ ${OS} == 'alpine' ]]; then
-			(cd qrencode-4.1.1 || exit && make uninstall)
-			rm -rf qrencode-* || exit
-			apk del wireguard-tools build-base libpng-dev
-		fi
-
-		rm -rf /etc/wireguard
-		rm -f /etc/sysctl.d/wg.conf
-
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status &>/dev/null
-		else
-			# Reload sysctl
-			sysctl --system
-
-			# Check if WireGuard is running
-			systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
-		fi
-		WG_RUNNING=$?
-
-		if [[ ${WG_RUNNING} -eq 0 ]]; then
-			echo "WireGuard konnte nicht ordnungsgemäß deinstalliert werden."
-			exit 1
-		else
-			echo "WireGuard wurde erfolgreich deinstalliert."
-			exit 0
-		fi
-	else
-		echo ""
-		echo "Deinstallation abgebrochen!"
-	fi
+generate_qr_code() {
+    echo "Generiere QR-Code für Client Konfiguration (~/${CLIENT_NAME}.conf)..."
+    echo "Stellen Sie sicher, dass Ihr Terminal UTF-8 unterstützt und die Schriftgröße klein genug ist."
+    echo ""
+    qrencode -t ansiutf8 < ~/"${CLIENT_NAME}.conf"
+    echo ""
+    echo "QR-Code oben kann mit der WireGuard Mobile App gescannt werden."
+    echo "Die Konfigurationsdatei befindet sich unter: ~/${CLIENT_NAME}.conf"
 }
 
-function manageMenu() {
-	echo "Willkommen bei WireGuard-install!"
-	echo "Das Git-Repository ist verfügbar unter: https://github.com/angristan/wireguard-install"
-	echo ""
-	echo "Es scheint, dass WireGuard bereits installiert ist."
-	echo ""
-	echo "Was möchten Sie tun?"
-	echo "   1) Einen neuen Benutzer hinzufügen"
-	echo "   2) Alle Benutzer auflisten"
-	echo "   3) Einen bestehenden Benutzer widerrufen"
-	echo "   4) WireGuard deinstallieren"
-	echo "   5) Beenden"
-	until [[ ${MENU_OPTION} =~ ^[1-5]$ ]]; do
-		read -rp "Wählen Sie eine Option [1-5]: " MENU_OPTION
-	done
-	case "${MENU_OPTION}" in
-	1)
-		newClient
-		;;
-	2)
-		listClients
-		;;
-	3)
-		revokeClient
-		;;
-	4)
-		uninstallWg
-		;;
-	5)
-		exit 0
-		;;
-	esac
-}
+# --- Hauptablauf ---
+check_root
+detect_distro
+install_packages
+detect_network
+generate_keys
+configure_server
+configure_client
+enable_forwarding
+start_wireguard
+generate_qr_code
 
-# Check for root, virt, OS...
-initialCheck
+echo ""
+echo "--- WireGuard Installation abgeschlossen ---"
+echo "Server Konfiguration: /etc/wireguard/${WG_INTERFACE}.conf"
+echo "Client Konfiguration: ~/${CLIENT_NAME}.conf (und als QR-Code oben)"
+echo "Der WireGuard-Dienst läuft und ist für den Start beim Booten aktiviert."
+echo "Stellen Sie sicher, dass der UDP Port ${WG_PORT} in Ihrer externen Firewall (falls vorhanden) geöffnet ist."
+echo "Um einen weiteren Client hinzuzufügen: "
+echo "1. Generieren Sie ein neues Schlüsselpaar (wg genkey | tee clientX_private.key | wg pubkey > clientX_public.key)."
+echo "2. Fügen Sie einen neuen [Peer] Block zur /etc/wireguard/${WG_INTERFACE}.conf hinzu mit dem Public Key des neuen Clients und einer freien IP aus ${WG_IPV4_SUBNET} / ${WG_IPV6_SUBNET}."
+echo "3. Starten Sie den WireGuard Dienst neu: systemctl restart wg-quick@${WG_INTERFACE}"
+echo "4. Erstellen Sie die Konfigurationsdatei für den neuen Client."
 
-# Check if WireGuard is already installed and load params
-if [[ -e /etc/wireguard/params ]]; then
-	source /etc/wireguard/params
-	manageMenu
-else
-	installWireGuard
-fi
+exit 0
