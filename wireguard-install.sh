@@ -3,17 +3,17 @@
 # WireGuard Full Automation Script
 # Installs WireGuard, configures server and first client, sets up firewall rules, generates QR code.
 # Supports IPv4 and IPv6.
-# UPDATED: Checks for existing config and offers to add new clients.
+# UPDATED: Checks for existing config, offers to add new clients, improved IP checks.
 
 # --- Konfiguration (Anpassbar bei Bedarf) ---
 WG_INTERFACE="wg0"
 WG_PORT="51820" # Standard WireGuard Port
-WG_IPV4_SUBNET="10.0.0.0/24" # Privates Subnetz für WireGuard VPN (IPv4)
+WG_IPV4_SUBNET="10.0.0.0/24" # Privates Subnetz für WireGuard VPN (IPv4) - Muss /24 sein für die aktuelle IP-Logik
 WG_IPV6_SUBNET="fd86:ea04:4453::/64" # Privates Unique Local Address (ULA) Subnetz für WireGuard VPN (IPv6)
 SERVER_WG_IPV4="10.0.0.1" # Server IP im WG Subnetz (IPv4)
 SERVER_WG_IPV6="fd86:ea04:4453::1" # Server IP im WG Subnetz (IPv6)
-# CLIENT_WG_IPV4="10.0.0.2" # Erste Client IP - wird jetzt dynamischer ermittelt oder für den ersten Client verwendet
-# CLIENT_WG_IPV6="fd86:ea04:4453::2" # Erste Client IP - wird jetzt dynamischer ermittelt oder für den ersten Client verwendet
+# CLIENT_WG_IPV4="10.0.0.2" # Erste Client IP - wird jetzt dynamischer ermittelt
+# CLIENT_WG_IPV6="fd86:ea04:4453::2" # Erste Client IP - wird jetzt dynamischer ermittelt
 FIRST_CLIENT_NAME="client1" # Name für die *erste* Client-Konfigurationsdatei
 # DNS Server für Clients (optional, aber empfohlen)
 CLIENT_DNS_1="1.1.1.1" # Cloudflare (Standard), Google oder eigene verwenden
@@ -32,13 +32,13 @@ USE_IPV6=false
 SERVER_PRIVKEY="" # Wird nur bei Neuinstallation gesetzt
 SERVER_PUBKEY=""  # Wird nur bei Neuinstallation gesetzt oder aus Datei gelesen
 # Client Keys werden jetzt pro Client generiert
-# CLIENT_PRIVKEY=""
-# CLIENT_PUBKEY=""
 CLIENT_CONF_PATH="" # Pfad zur finalen Client-Konfig (wird dynamisch gesetzt)
 FIREWALLD_ACTIVE=false
 WG_CONF_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
 SERVER_PUBKEY_FILE="/etc/wireguard/${WG_INTERFACE}_server_public.key"
 SERVER_PRIVKEY_FILE="/etc/wireguard/${WG_INTERFACE}_server_private.key" # Für die Server-Konfig benötigt
+NEXT_CLIENT_WG_IPV4="" # Globale Variable für nächste IP
+NEXT_CLIENT_WG_IPV6="" # Globale Variable für nächste IP
 
 # Exit on error
 set -e
@@ -148,8 +148,9 @@ install_packages() {
 
 
 detect_network() {
-    # (Funktion unverändert)
     echo "Ermittle Netzwerk-Konfiguration..."
+    # HINWEIS: Diese Methode zur Ermittlung des Standard-Interfaces ist für einfache Setups gut,
+    # kann aber bei komplexeren Routing-Konfigurationen fehlschlagen.
     SERVER_PUB_NIC=$(ip route | grep default | awk '{print $5}' | head -n 1)
     if [[ -z "$SERVER_PUB_NIC" ]]; then
         echo "FEHLER: Konnte das Standard-Netzwerkinterface nicht automatisch finden."
@@ -159,8 +160,12 @@ detect_network() {
 
     # Versuche öffentliche IPv4 zu ermitteln
     SERVER_IPV4=$(ip -4 addr show dev "$SERVER_PUB_NIC" | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
-    if [[ -z "$SERVER_IPV4" || "$SERVER_IPV4" == 10.* || "$SERVER_IPV4" == 192.168.* || "$SERVER_IPV4" == 172.{16..31}.* ]]; then
-        echo "Lokale IPv4 auf $SERVER_PUB_NIC ist privat oder nicht gefunden, versuche externen Dienst..."
+    # Verbesserte Prüfung auf private IPv4-Adressen mit Regex
+    if [[ -z "$SERVER_IPV4" ]] || \
+       [[ "$SERVER_IPV4" =~ ^10\. ]] || \
+       [[ "$SERVER_IPV4" =~ ^192\.168\. ]] || \
+       [[ "$SERVER_IPV4" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]; then
+        echo "Lokale IPv4 auf $SERVER_PUB_NIC ist privat oder nicht gefunden ($SERVER_IPV4), versuche externen Dienst..."
         SERVER_IPV4=$(curl -4fsS https://ifconfig.me/ip || curl -4fsS https://api.ipify.org || wget -qO- -t1 -T2 ipv4.icanhazip.com || echo "")
     fi
     if [[ -z "$SERVER_IPV4" ]]; then
@@ -278,7 +283,7 @@ create_client_config_file() {
     # DNS String bauen
     local DNS_STRING="${CLIENT_DNS_1}"
     [ -n "$CLIENT_DNS_2" ] && DNS_STRING="${DNS_STRING}, ${CLIENT_DNS_2}"
-    [ -n "$CLIENT_DNS_IPV6" ] && [ "$USE_IPV6" = true ] && DNS_STRING="${DNS_STRING}, ${CLIENT_DNS_IPV6}"
+    [ -n "$CLIENT_DNS_IPV6" ] && [ "$USE_IPV6" = true ] && [ -n "$client_wg_ipv6" ] && DNS_STRING="${DNS_STRING}, ${CLIENT_DNS_IPV6}"
 
     echo "Erstelle Client Konfigurationsdatei (${client_conf_path})..."
     cat > "${client_conf_path}" << EOF
@@ -293,7 +298,7 @@ DNS = ${DNS_STRING}
 # Name = Server
 PublicKey = ${server_pubkey}
 Endpoint = ${server_endpoint}
-AllowedIPs = 0.0.0.0/0$( [ "$USE_IPV6" = true ] && echo ", ::/0" )
+AllowedIPs = 0.0.0.0/0$( [ "$USE_IPV6" = true ] && [ -n "$client_wg_ipv6" ] && echo ", ::/0" )
 # Optional: PersistentKeepalive alle 25 Sekunden senden, um NAT/Firewall offen zu halten
 # PersistentKeepalive = 25
 EOF
@@ -369,6 +374,9 @@ add_peer_to_server_config() {
     local client_wg_ipv6="$4"
 
     echo "Füge Peer '$client_name' zur Server Konfiguration hinzu..."
+    # Stelle sicher, dass am Ende der Datei eine neue Zeile ist, falls nicht
+    [[ $(tail -c1 "${WG_CONF_FILE}" | wc -l) -eq 0 ]] && echo "" >> "${WG_CONF_FILE}"
+
     cat >> "${WG_CONF_FILE}" << EOF
 
 # --- Client: ${client_name} ---
@@ -464,40 +472,72 @@ generate_qr_code() {
     return 0
 }
 
-# Funktion zum Ermitteln der nächsten freien IPs
+# Funktion zum Ermitteln der nächsten freien IPs mit Subnetzprüfung
 find_next_ips() {
-    local last_ipv4_suffix=1 # Start bei .2 (Suffix 1 ist Server)
-    local last_ipv6_suffix=1 # Start bei ::2 (Suffix 1 ist Server)
+    local last_ipv4_suffix=1 # Start bei Suffix 1 (Server-IP), nächste ist 2
+    local last_ipv6_suffix=1 # Start bei Suffix 1 (Server-IP), nächste ist 2
     local ipv4_base=$(echo $SERVER_WG_IPV4 | cut -d'.' -f1-3)
-    local ipv6_base=$(echo $SERVER_WG_IPV6 | sed 's/::1$//') # Basis-Teil der ULA
+    local ipv6_base_prefix=$(echo $SERVER_WG_IPV6 | sed 's/::1$//') # Basis-Teil der ULA
 
-    # Extrahiere alle vorhandenen Client-IP-Suffixe aus AllowedIPs
-    if [ -f "$WG_CONF_FILE" ]; then
-        # IPv4 Suffixe
-        current_ipv4_suffixes=$(grep AllowedIPs "$WG_CONF_FILE" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep "^${ipv4_base}\." | cut -d'.' -f4 | sort -n)
-        if [ -n "$current_ipv4_suffixes" ]; then
-            last_ipv4_suffix=$(echo "$current_ipv4_suffixes" | tail -n 1)
-        fi
-
-        # IPv6 Suffixe (Hex)
-        if [ "$USE_IPV6" = true ]; then
-             # Extrahieren, ::X am Ende suchen, X (Hex) nehmen, dezimal umwandeln, sortieren
-             current_ipv6_suffixes_hex=$(grep AllowedIPs "$WG_CONF_FILE" | grep -oE 'fd[0-9a-f:]+::[0-9a-f]+' | grep "^${ipv6_base}::" | sed 's/.*:://' | sort -n)
-             if [ -n "$current_ipv6_suffixes_hex" ]; then
-                 last_ipv6_suffix_hex=$(echo "$current_ipv6_suffixes_hex" | tail -n 1)
-                 # Konvertiere Hex zu Dezimal für Inkrementierung
-                 last_ipv6_suffix=$((16#$last_ipv6_suffix_hex))
-             fi
-        fi
+    # Sicherstellen, dass die IPv4-Basis korrekt extrahiert wurde
+    if [[ ! "$ipv4_base" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "FEHLER: Konnte keine gültige IPv4-Basis aus $SERVER_WG_IPV4 extrahieren."
+      exit 1
+    fi
+    # Sicherstellen, dass die IPv6-Basis korrekt extrahiert wurde
+    if [[ "$USE_IPV6" = true && -z "$ipv6_base_prefix" ]]; then
+        echo "FEHLER: Konnte keine gültige IPv6-Basis aus $SERVER_WG_IPV6 extrahieren."
+        exit 1
     fi
 
-    # Nächste IPs berechnen
-    NEXT_CLIENT_WG_IPV4="${ipv4_base}.$((last_ipv4_suffix + 1))"
+    # Extrahiere alle vorhandenen Client-IP-Suffixe aus AllowedIPs
+    # Prüft nur, wenn die Datei existiert und Peers ([Peer] Sektion) enthält
+    if [ -f "$WG_CONF_FILE" ] && grep -q -E '^\s*\[Peer\]' "$WG_CONF_FILE"; then
+        # IPv4 Suffixe (/32 angenommen)
+        # Grep nach AllowedIPs, extrahiere IPv4-Adressen, filtere nach passender Basis, extrahiere letztes Oktett, sortiere numerisch
+        local current_ipv4_suffixes=$(grep -A 3 -E '^\s*\[Peer\]' "$WG_CONF_FILE" | grep 'AllowedIPs' | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep "^${ipv4_base}\." | cut -d'.' -f4 | sort -n)
+        if [ -n "$current_ipv4_suffixes" ]; then
+            last_ipv4_suffix=$(echo "$current_ipv4_suffixes" | tail -n 1)
+            echo "Höchstes gefundenes IPv4-Suffix: $last_ipv4_suffix"
+        fi
+
+        # IPv6 Suffixe (/128 angenommen)
+        if [ "$USE_IPV6" = true ]; then
+             # Grep nach AllowedIPs, extrahiere IPv6-Adressen, filtere nach passender Basis, extrahiere Suffix nach '::', sortiere numerisch (hex)
+             local current_ipv6_suffixes_hex=$(grep -A 3 -E '^\s*\[Peer\]' "$WG_CONF_FILE" | grep 'AllowedIPs' | grep -oE '[0-9a-fA-F:]+::[0-9a-fA-F]+' | grep "^${ipv6_base_prefix}::" | sed 's/.*:://' | sort -n)
+             if [ -n "$current_ipv6_suffixes_hex" ]; then
+                 local last_ipv6_suffix_hex=$(echo "$current_ipv6_suffixes_hex" | tail -n 1)
+                 # Konvertiere Hex zu Dezimal für Inkrementierung
+                 # Verwende bc für sicherere Hex-Dezimal-Konvertierung
+                 last_ipv6_suffix=$(echo "ibase=16; ${last_ipv6_suffix_hex^^}" | bc) # ^^ für Großbuchstaben
+                 echo "Höchstes gefundenes IPv6-Suffix (dezimal): $last_ipv6_suffix (hex: $last_ipv6_suffix_hex)"
+             fi
+        fi
+    else
+        echo "Keine vorhandenen Peers in ${WG_CONF_FILE} gefunden oder Datei existiert nicht. Starte IP-Vergabe bei .2 / ::2."
+    fi
+
+    # Nächste IPs berechnen und prüfen
+    # IPv4
+    local next_ipv4_suffix=$((last_ipv4_suffix + 1))
+    # Prüfe auf Subnetzgrenze (für /24: .1 bis .254 sind nutzbar)
+    if [[ "$next_ipv4_suffix" -ge 255 ]]; then
+        echo "FEHLER: Das IPv4-Subnetz ($WG_IPV4_SUBNET) scheint voll zu sein (nächstes Suffix wäre $next_ipv4_suffix)."
+        echo "Bitte passen Sie WG_IPV4_SUBNET an oder löschen Sie alte Peers."
+        exit 1
+    fi
+    NEXT_CLIENT_WG_IPV4="${ipv4_base}.${next_ipv4_suffix}"
+
+    # IPv6
     if [ "$USE_IPV6" = true ]; then
-        next_ipv6_suffix_dec=$((last_ipv6_suffix + 1))
+        local next_ipv6_suffix_dec=$((last_ipv6_suffix + 1))
+        # IPv6 ULA /64 hat einen riesigen Adressraum, eine Überlaufprüfung ist hier meist unnötig.
+        # Theoretisches Limit für Suffix wäre ffff (65535), aber praktisch irrelevant.
+        # if [[ "$next_ipv6_suffix_dec" -gt 65535 ]]; then echo "FEHLER: IPv6 Suffix Limit erreicht!"; exit 1; fi
+
         # Konvertiere zurück zu Hex für die Adresse
-        next_ipv6_suffix_hex=$(printf '%x\n' $next_ipv6_suffix_dec)
-        NEXT_CLIENT_WG_IPV6="${ipv6_base}::${next_ipv6_suffix_hex}"
+        local next_ipv6_suffix_hex=$(printf '%x\n' $next_ipv6_suffix_dec)
+        NEXT_CLIENT_WG_IPV6="${ipv6_base_prefix}::${next_ipv6_suffix_hex}"
     else
         NEXT_CLIENT_WG_IPV6=""
     fi
@@ -510,22 +550,24 @@ add_new_client_workflow() {
     echo ""
     echo "--- Neuen WireGuard Client hinzufügen ---"
 
-    # Nächste IPs finden
-    find_next_ips # Setzt NEXT_CLIENT_WG_IPV4 und NEXT_CLIENT_WG_IPV6
+    # Nächste IPs finden (setzt globale Variablen NEXT_CLIENT_WG_IPV4/6)
+    # Die Funktion bricht bei Fehlern (z.B. volles Subnetz) selbst ab.
+    find_next_ips
 
     # Client Namen abfragen
     local new_client_name=""
     while [[ -z "$new_client_name" ]]; do
-        read -p "Geben Sie einen Namen für den neuen Client ein (z.B. handy_peter): " new_client_name
-        # Einfache Validierung: keine Leerzeichen, nicht leer
-        if [[ "$new_client_name" =~ \s ]] || [[ -z "$new_client_name" ]]; then
-            echo "Ungültiger Name. Bitte keine Leerzeichen verwenden."
+        read -p "Geben Sie einen Namen für den neuen Client ein (z.B. handy_peter, keine Leerzeichen): " new_client_name
+        # Einfache Validierung: keine Leerzeichen, nicht leer, keine Sonderzeichen (optional)
+        if [[ "$new_client_name" =~ \s ]] || [[ -z "$new_client_name" ]] || [[ ! "$new_client_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "Ungültiger Name. Bitte nur Buchstaben, Zahlen, Bindestrich, Unterstrich und keine Leerzeichen verwenden."
             new_client_name=""
+            continue
         fi
         # Prüfen ob Schlüsseldateien schon existieren
-        if [ -f "/etc/wireguard/${new_client_name}_private.key" ]; then
-             echo "WARNUNG: Schlüsseldatei /etc/wireguard/${new_client_name}_private.key existiert bereits. Überschreiben?"
-             read -p "Fortfahren? (j/N): " confirm_overwrite
+        if [ -f "/etc/wireguard/${new_client_name}_private.key" ] || [ -f "/etc/wireguard/${new_client_name}_public.key" ]; then
+             echo "WARNUNG: Schlüsseldatei(en) für '$new_client_name' unter /etc/wireguard/ existieren bereits."
+             read -p "Überschreiben und fortfahren? (j/N): " confirm_overwrite
              if [[ ! "$confirm_overwrite" =~ ^[jJ]([aA])?$ ]]; then
                  new_client_name="" # Erneut fragen
              fi
@@ -552,47 +594,48 @@ add_new_client_workflow() {
 
     # Endpoint bestimmen (wie im Original-Skript)
     local ENDPOINT=""
+    # Bevorzuge IPv6, wenn verfügbar und nicht Link-Local
     if [[ "$USE_IPV6" = true && -n "$SERVER_IPV6" && ! "$SERVER_IPV6" == fe80::* ]]; then
         ENDPOINT="[${SERVER_IPV6}]:${WG_PORT}"
+    elif [[ -n "$SERVER_IPV4" ]]; then
+         ENDPOINT="${SERVER_IPV4}:${WG_PORT}"
     fi
-    if [[ -z "$ENDPOINT" && -n "$SERVER_IPV4" ]]; then
-        ENDPOINT="${SERVER_IPV4}:${WG_PORT}"
-    fi
+
     if [[ -z "$ENDPOINT" ]]; then
-        echo "FEHLER: Konnte keinen gültigen Server Endpoint (IPv4 oder IPv6) bestimmen."
+        echo "FEHLER: Konnte keinen gültigen Server Endpoint (öffentliche IPv4 oder IPv6) bestimmen."
         exit 1
     fi
     echo "Server Endpoint für Client: $ENDPOINT"
 
     # Pfad für Client-Konfig bestimmen
-    local client_conf_path=""
-    if [ -n "$SUDO_USER" ]; then
+    local client_conf_path_local="" # Lokale Variable verwenden
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
         USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-        if [ -d "$USER_HOME" ]; then
-            client_conf_path="${USER_HOME}/${new_client_name}.conf"
-            echo "Client Konfiguration wird in '$client_conf_path' für Benutzer '$SUDO_USER' gespeichert."
+        if [ -d "$USER_HOME" ] && [ -w "$USER_HOME" ]; then # Prüfe ob Home existiert und beschreibbar ist
+            client_conf_path_local="${USER_HOME}/${new_client_name}.conf"
+            echo "Client Konfiguration wird in '$client_conf_path_local' für Benutzer '$SUDO_USER' gespeichert."
         else
-            client_conf_path="/root/${new_client_name}.conf"
-            echo "WARNUNG: Home-Verzeichnis für '$SUDO_USER' nicht gefunden. Speichere in '$client_conf_path'."
+            client_conf_path_local="/root/${new_client_name}.conf"
+            echo "WARNUNG: Home-Verzeichnis für '$SUDO_USER' nicht gefunden oder nicht beschreibbar. Speichere in '$client_conf_path_local'."
         fi
     else
-        client_conf_path="/root/${new_client_name}.conf"
-        echo "Kein SUDO_USER gefunden. Speichere Client Konfiguration in '$client_conf_path'."
+        client_conf_path_local="/root/${new_client_name}.conf"
+        echo "Kein SUDO_USER gefunden oder root. Speichere Client Konfiguration in '$client_conf_path_local'."
     fi
 
     # Client Konfigurationsdatei erstellen
-    create_client_config_file "$new_client_name" "$client_conf_path" "$client_privkey" "$NEXT_CLIENT_WG_IPV4" "$NEXT_CLIENT_WG_IPV6" "$server_pubkey" "$ENDPOINT"
+    create_client_config_file "$new_client_name" "$client_conf_path_local" "$client_privkey" "$NEXT_CLIENT_WG_IPV4" "$NEXT_CLIENT_WG_IPV6" "$server_pubkey" "$ENDPOINT"
 
     # WireGuard neu starten, um den neuen Peer zu laden
     start_wireguard
 
     # QR Code generieren
-    generate_qr_code "$client_conf_path"
+    generate_qr_code "$client_conf_path_local"
 
     echo ""
     echo "--- Neuer Client '$new_client_name' hinzugefügt ---"
     echo "Server Konfiguration aktualisiert: ${WG_CONF_FILE}"
-    echo "Client Konfiguration gespeichert: ${client_conf_path}"
+    echo "Client Konfiguration gespeichert: ${client_conf_path_local}"
     echo "Client Private Key: ${client_privkey_file}"
     echo "Verwenden Sie die Konfigurationsdatei oder den QR-Code auf dem Client-Gerät."
 }
@@ -607,24 +650,22 @@ if [ -f "$WG_CONF_FILE" ]; then
     echo "Vorhandene WireGuard-Konfiguration gefunden: $WG_CONF_FILE"
     # Prüfen ob der Service läuft
     if systemctl is-active --quiet wg-quick@${WG_INTERFACE}; then
-         echo "WireGuard Service (wg-quick@${WG_INTERFACE}) ist aktiv."
+          echo "WireGuard Service (wg-quick@${WG_INTERFACE}) ist aktiv."
     else
-         echo "WARNUNG: WireGuard Service (wg-quick@${WG_INTERFACE}) ist NICHT aktiv."
-         read -p "Möchten Sie versuchen, den Dienst zu starten? (j/N): " start_service
-         if [[ "$start_service" =~ ^[jJ]([aA])?$ ]]; then
-             start_wireguard # Versucht Start/Restart & Aktivierung
-         fi
+          echo "WARNUNG: WireGuard Service (wg-quick@${WG_INTERFACE}) ist NICHT aktiv."
+          read -p "Möchten Sie versuchen, den Dienst zu starten? (j/N): " start_service
+          if [[ "$start_service" =~ ^[jJ]([aA])?$ ]]; then
+              start_wireguard # Versucht Start/Restart & Aktivierung
+          fi
     fi
 
     echo ""
     read -p "Möchten Sie einen neuen Client hinzufügen? (j/N): " add_client
     if [[ "$add_client" =~ ^[jJ]([aA])?$ ]]; then
-        # Pakete prüfen/installieren, falls doch was fehlt (z.B. qrencode)
+        # Stelle sicher, dass alle Tools (auch qrencode) und Einstellungen aktuell sind
         install_packages
-        # Firewall prüfen/konfigurieren (schadet nicht, falls Regeln fehlen)
-        configure_firewall
-        # IP Forwarding prüfen/aktivieren (wichtig!)
-        enable_forwarding
+        configure_firewall # Sicherstellen, dass Firewall-Regeln korrekt sind
+        enable_forwarding  # Sicherstellen, dass Forwarding aktiv ist
         # Den neuen Client hinzufügen
         add_new_client_workflow
     else
@@ -639,6 +680,7 @@ else
     install_packages
     configure_firewall
     generate_server_keys # Server Keys generieren
+
     # Ersten Client vorbereiten
     FIRST_CLIENT_PRIVKEY_FILE="/etc/wireguard/${FIRST_CLIENT_NAME}_private.key"
     FIRST_CLIENT_PUBKEY_FILE="/etc/wireguard/${FIRST_CLIENT_NAME}_public.key"
@@ -646,49 +688,51 @@ else
     FIRST_CLIENT_PRIVKEY=$(cat "$FIRST_CLIENT_PRIVKEY_FILE")
     FIRST_CLIENT_PUBKEY=$(cat "$FIRST_CLIENT_PUBKEY_FILE")
 
-    # Nächste IPs für den *ersten* Client finden (wird typischerweise .2 / ::2 sein)
+    # Nächste IPs für den *ersten* Client finden (setzt globale Variablen)
+    # Sollte .2 / ::2 sein, wenn keine Peers existieren. Bricht bei Fehler ab.
     find_next_ips
-    FIRST_CLIENT_WG_IPV4=$NEXT_CLIENT_WG_IPV4
-    FIRST_CLIENT_WG_IPV6=$NEXT_CLIENT_WG_IPV6
+    # Die globalen Variablen NEXT_CLIENT_WG_IPV4/6 enthalten jetzt die IPs für den ersten Client
 
     configure_server # Server Basiskonfig erstellen
-    add_peer_to_server_config "$FIRST_CLIENT_NAME" "$FIRST_CLIENT_PUBKEY" "$FIRST_CLIENT_WG_IPV4" "$FIRST_CLIENT_WG_IPV6" # Ersten Peer hinzufügen
+    # Ersten Peer hinzufügen mit den ermittelten IPs
+    add_peer_to_server_config "$FIRST_CLIENT_NAME" "$FIRST_CLIENT_PUBKEY" "$NEXT_CLIENT_WG_IPV4" "$NEXT_CLIENT_WG_IPV6"
 
     # Server Public Key und Endpoint bestimmen
     if [ ! -f "$SERVER_PUBKEY_FILE" ]; then echo "FEHLER: Server Public Key Datei nicht gefunden!"; exit 1; fi
     server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
     ENDPOINT=""
+    # Bevorzuge IPv6, wenn verfügbar und nicht Link-Local
     if [[ "$USE_IPV6" = true && -n "$SERVER_IPV6" && ! "$SERVER_IPV6" == fe80::* ]]; then
         ENDPOINT="[${SERVER_IPV6}]:${WG_PORT}"
-    fi
-    if [[ -z "$ENDPOINT" && -n "$SERVER_IPV4" ]]; then
-        ENDPOINT="${SERVER_IPV4}:${WG_PORT}"
+    elif [[ -n "$SERVER_IPV4" ]]; then
+         ENDPOINT="${SERVER_IPV4}:${WG_PORT}"
     fi
     if [[ -z "$ENDPOINT" ]]; then echo "FEHLER: Konnte keinen gültigen Server Endpoint bestimmen."; exit 1; fi
 
     # Pfad für erste Client-Konfig bestimmen
-    client_conf_path=""
-    if [ -n "$SUDO_USER" ]; then
+    client_conf_path_local="" # Lokale Variable verwenden
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
         USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-        if [ -d "$USER_HOME" ]; then
-            client_conf_path="${USER_HOME}/${FIRST_CLIENT_NAME}.conf"
+        if [ -d "$USER_HOME" ] && [ -w "$USER_HOME" ]; then
+            client_conf_path_local="${USER_HOME}/${FIRST_CLIENT_NAME}.conf"
         else
-            client_conf_path="/root/${FIRST_CLIENT_NAME}.conf"
+            client_conf_path_local="/root/${FIRST_CLIENT_NAME}.conf"
+            echo "WARNUNG: Home-Verzeichnis für '$SUDO_USER' nicht gefunden/beschreibbar. Speichere in '$client_conf_path_local'."
         fi
     else
-        client_conf_path="/root/${FIRST_CLIENT_NAME}.conf"
+        client_conf_path_local="/root/${FIRST_CLIENT_NAME}.conf"
     fi
-    CLIENT_CONF_PATH=$client_conf_path # Für die Abschlussmeldung
+    CLIENT_CONF_PATH=$client_conf_path_local # Für die Abschlussmeldung
 
-    # Erste Client Konfigurationsdatei erstellen
-    create_client_config_file "$FIRST_CLIENT_NAME" "$client_conf_path" "$FIRST_CLIENT_PRIVKEY" "$FIRST_CLIENT_WG_IPV4" "$FIRST_CLIENT_WG_IPV6" "$server_pubkey" "$ENDPOINT"
+    # Erste Client Konfigurationsdatei erstellen, verwendet globale NEXT_CLIENT_WG_IPV4/6
+    create_client_config_file "$FIRST_CLIENT_NAME" "$client_conf_path_local" "$FIRST_CLIENT_PRIVKEY" "$NEXT_CLIENT_WG_IPV4" "$NEXT_CLIENT_WG_IPV6" "$server_pubkey" "$ENDPOINT"
 
     enable_forwarding
     start_wireguard
 
     # QR Code generieren
     QR_GENERATED=false
-    if generate_qr_code "$client_conf_path"; then
+    if generate_qr_code "$client_conf_path_local"; then
         QR_GENERATED=true
     fi
 
@@ -697,7 +741,7 @@ else
     echo "Server Konfiguration: ${WG_CONF_FILE}"
     echo "Server Private Key:   ${SERVER_PRIVKEY_FILE}"
     echo "Server Public Key:    ${SERVER_PUBKEY_FILE}"
-    echo "Erste Client Konfig:  ${CLIENT_CONF_PATH}"
+    echo "Erste Client Konfig:  ${CLIENT_CONF_PATH}" # Verwendet die globale Variable für den Pfad
     echo "Erste Client PrivKey: ${FIRST_CLIENT_PRIVKEY_FILE}"
 
     if [ "$QR_GENERATED" = false ]; then
