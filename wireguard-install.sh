@@ -79,55 +79,71 @@ detect_distro() {
 }
 
 install_packages() {
-    # (Funktion leicht angepasst für Klarheit)
-    echo "Installiere notwendige Pakete (falls noch nicht vorhanden)..."
-    PACKAGES_NEEDED="wireguard-tools qrencode iptables" # Basispakete
-    PACKAGES_TO_INSTALL=""
+    echo "Stelle sicher, dass notwendige Pakete installiert sind..."
+    # Definiere die Basispakete
+    PACKAGES_NEEDED="wireguard-tools qrencode iptables"
 
-    for pkg in $PACKAGES_NEEDED; do
-        if ! command -v $pkg >/dev/null 2>&1 && ! dpkg -s $pkg > /dev/null 2>&1 && ! rpm -q $pkg > /dev/null 2>&1; then
-             PACKAGES_TO_INSTALL="${PACKAGES_TO_INSTALL} ${pkg}"
-        fi
-    done
-
-     # Distributionsspezifische Pakete/Manager
+     # Distributionsspezifische Logik
      if [[ "$OS" == "debian" || "$OS" == "ubuntu" ]]; then
-         PKG_MANAGER="apt-get"
-         UPDATE_CMD="apt-get update"
-         INSTALL_CMD="apt-get install -y"
-         # Evtl. iptables-persistent hinzufügen, falls gewünscht
+         echo "System ist Debian/Ubuntu. Verwende apt-get."
+         # Führe immer ein Update aus, um sicherzustellen, dass die Paketlisten aktuell sind
+         apt-get update
+         # Versuche die Installation. Wenn Pakete aktuell sind, macht apt nichts.
+         apt-get install -y $PACKAGES_NEEDED
      elif [[ "$OS" == "centos" || "$OS" == "fedora" || "$OS" == "rhel" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
          PKG_MANAGER="dnf"
          if ! command -v dnf > /dev/null; then PKG_MANAGER="yum"; fi
-         UPDATE_CMD="" # dnf/yum machen das implizit
-         INSTALL_CMD="$PKG_MANAGER install -y"
+         echo "System ist RHEL-basiert. Verwende $PKG_MANAGER."
+
+         # EPEL für CentOS 7 hinzufügen/prüfen
          if [[ "$OS" == "centos" && ${VER%%.*} -eq 7 ]]; then
-            # EPEL für CentOS 7 benötigt
-            if ! rpm -q epel-release > /dev/null 2>&1; then
-                echo "CentOS 7: Installiere EPEL Repository..."
-                $PKG_MANAGER install -y epel-release
-            fi
-            # iptables-services für persistente Regeln auf C7
-            if ! rpm -q iptables-services > /dev/null 2>&1; then
-                 PACKAGES_TO_INSTALL="${PACKAGES_TO_INSTALL} iptables-services"
-            fi
+             if ! rpm -q epel-release > /dev/null 2>&1; then
+                 echo "CentOS 7: Installiere EPEL Repository..."
+                 $PKG_MANAGER install -y epel-release
+             else
+                 echo "CentOS 7: EPEL Repository bereits vorhanden."
+             fi
+             # iptables-services für CentOS 7 hinzufügen, falls benötigt
+             if ! rpm -q iptables-services > /dev/null 2>&1; then
+                  PACKAGES_NEEDED="${PACKAGES_NEEDED} iptables-services"
+             fi
          fi
+         # Versuche die Installation
+         $PKG_MANAGER install -y $PACKAGES_NEEDED
      else
-         echo "FEHLER: Nicht unterstützte Distribution '$OS'. Bitte manuell installieren: $PACKAGES_NEEDED."
+         echo "FEHLER: Nicht unterstützte Distribution '$OS'."
+         echo "Bitte manuell installieren: $PACKAGES_NEEDED."
          exit 1
      fi
 
-     if [ -n "$PACKAGES_TO_INSTALL" ]; then
-        echo "Folgende Pakete werden installiert: $PACKAGES_TO_INSTALL"
-        if [ -n "$UPDATE_CMD" ]; then $UPDATE_CMD; fi
-        $INSTALL_CMD $PACKAGES_TO_INSTALL
-     else
-        echo "Notwendige Pakete scheinen bereits installiert zu sein."
+     # --- Finale Überprüfung der essentiellen Befehle ---
+     # Prüfe ob wg Kommando *jetzt* verfügbar ist
+     if ! command -v wg >/dev/null 2>&1; then
+          echo "FEHLER: 'wg' Befehl nach Installationsversuch immer noch nicht gefunden."
+          echo "Mögliche Ursachen:"
+          echo "  - Installationsfehler oben prüfen (z.B. 404 Not Found, Hash Sum mismatch)."
+          echo "  - Netzwerkprobleme beim Download der Pakete."
+          echo "  - Konflikte mit anderen Paketen."
+          echo "  - Das Paket 'wireguard-tools' konnte nicht korrekt installiert werden."
+          echo "Führen Sie zur Diagnose manuell aus: apt-get update && apt-get install wireguard-tools" # Oder dnf/yum
+          exit 1
+     fi
+      # Prüfe qrencode (optional, nur Warnung)
+     if ! command -v qrencode >/dev/null 2>&1; then
+          echo "WARNUNG: 'qrencode' Befehl nach Installationsversuch nicht gefunden. QR-Code Generierung wird fehlschlagen."
+          # Nicht abbrechen, da Kernfunktionalität noch gehen könnte
+     fi
+     # Prüfe iptables (essentiell für NAT/Firewall über PostUp/Down)
+     if ! command -v iptables >/dev/null 2>&1; then
+          # Versuche ip6tables als Fallback zu prüfen, falls nur das benötigt wird (unwahrscheinlich)
+          if ! command -v ip6tables >/dev/null 2>&1 || [ "$USE_IPV6" = false ]; then
+            echo "FEHLER: 'iptables' Befehl nach Installationsversuch nicht gefunden. Firewall/NAT-Regeln können nicht gesetzt werden."
+            echo "Führen Sie zur Diagnose manuell aus: apt-get update && apt-get install iptables" # Oder dnf/yum
+            exit 1
+          fi
      fi
 
-    # Prüfe ob wg Kommando verfügbar ist
-    command -v wg >/dev/null 2>&1 || { echo "FEHLER: 'wg' Befehl nach Installation nicht gefunden. Ist das Kernel-Modul geladen/installiert?"; exit 1; }
-    echo "Paketprüfung abgeschlossen."
+    echo "Notwendige Pakete installiert oder bereits aktuell."
 }
 
 
